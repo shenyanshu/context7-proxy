@@ -38,6 +38,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      # runner 默认 builder 是 docker 驱动，不支持 GHA 缓存导出
+      # （Cache export is not supported for the docker driver），
+      # 先建 docker-container 驱动 builder，type=gha 缓存才能生效
+      - uses: docker/setup-buildx-action@v3
       # GHCR 要求镜像名全小写，仓库路径可能含大写字母（如 Context7-Proxy）。
       # 用 tr 而非 bash4 的 ${var,,}：行为相同且任何 shell 可验证
       - name: 计算小写镜像名
