@@ -1,4 +1,4 @@
-import { Badge, Card, Progress, Tooltip, Typography } from 'antd';
+import { Badge, Card, Typography } from 'antd';
 import { fromNow } from '../format';
 import { keyStatusColor, keyStatusText } from '../keyStatusUi';
 import type { KeyStatus } from '../types';
@@ -8,10 +8,9 @@ interface KeyCardProps {
   keyStatus: KeyStatus;
 }
 
-/** 单个上游 Key 的状态卡：状态、额度、使用量、最近使用 */
+/** 单个上游 Key 的状态卡：状态、使用量、最近使用与冷却倒计时 */
 export function KeyCard({ keyStatus }: KeyCardProps) {
-  const { status, value, remaining, limit, cooldownUntil, requestCount, lastUsedAt } = keyStatus;
-  const quotaKnown = remaining !== null && limit !== null && limit > 0;
+  const { status, value, cooldownUntil, requestCount, lastUsedAt } = keyStatus;
 
   return (
     <Card size="small" className="key-card">
@@ -20,21 +19,6 @@ export function KeyCard({ keyStatus }: KeyCardProps) {
           {value}
         </Typography.Text>
         <Badge color={keyStatusColor(status)} text={keyStatusText(status)} />
-      </div>
-
-      <div className="key-card-row">
-        <span className="key-card-label">剩余额度</span>
-        {quotaKnown ? (
-          <Tooltip title={`${remaining} / ${limit}`}>
-            <Progress
-              percent={Math.round((remaining! / limit!) * 100)}
-              size="small"
-              strokeColor={remaining === 0 ? '#ff4d4f' : undefined}
-            />
-          </Tooltip>
-        ) : (
-          <Typography.Text type="secondary">未知</Typography.Text>
-        )}
       </div>
 
       <div className="key-card-row">

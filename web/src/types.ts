@@ -8,10 +8,6 @@ export interface KeyStatus {
   value: string;
   enabled: boolean;
   status: KeyStatusValue;
-  /** 剩余额度，未知为 null */
-  remaining: number | null;
-  /** 额度上限，未知为 null */
-  limit: number | null;
   /** 冷却结束时间（Unix 秒），不在冷却中为 null */
   cooldownUntil: number | null;
   requestCount: number;

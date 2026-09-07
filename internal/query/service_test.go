@@ -387,9 +387,11 @@ func TestQuotaObservedAndPreserved(t *testing.T) {
 	if _, err := f.svc.Execute(context.Background(), PathSearch, mustValues("libraryName", "x", "query", "docs")); err != nil {
 		t.Fatal(err)
 	}
-	keys, _ := f.st.ListKeys()
-	if keys[0].Remaining == nil || *keys[0].Remaining != 42 {
-		t.Fatalf("remaining = %v, want 42", keys[0].Remaining)
+	// 额度观测断言走调度视图（ListPoolKeys）：显示层（ListKeys→KeyStatus）
+	// 已删除额度字段，但 DB 列仍喂内部调度（余量归零主动冷却）
+	pool, _ := f.st.ListPoolKeys()
+	if pool[0].Remaining == nil || *pool[0].Remaining != 42 {
+		t.Fatalf("remaining = %v, want 42", pool[0].Remaining)
 	}
 
 	// 头缺失时旧值保留
@@ -402,9 +404,9 @@ func TestQuotaObservedAndPreserved(t *testing.T) {
 	if _, err := f.svc.Execute(context.Background(), PathSearch, mustValues("libraryName", "other", "query", "docs")); err != nil {
 		t.Fatal(err)
 	}
-	keys, _ = f.st.ListKeys()
-	if keys[0].Remaining == nil || *keys[0].Remaining != 42 {
-		t.Fatalf("missing header must not clear observed remaining, got %v", keys[0].Remaining)
+	pool, _ = f.st.ListPoolKeys()
+	if pool[0].Remaining == nil || *pool[0].Remaining != 42 {
+		t.Fatalf("missing header must not clear observed remaining, got %v", pool[0].Remaining)
 	}
 }
 

@@ -1,9 +1,12 @@
 package store
 
 import (
+	"database/sql"
 	"strings"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 // newTestStore 每个用例独立临时库文件，保证用例间无残留状态。
@@ -56,10 +59,9 @@ func TestKeyCRUD(t *testing.T) {
 	if ks.Value != raw {
 		t.Fatalf("value = %q, want full plaintext key (self-hosted admin view)", ks.Value)
 	}
-	// 新 key 从未测试过：额度字段必须为 null 而非 0（0 是有效余量，语义不同）
-	if ks.Status != "untested" || ks.Remaining != nil || ks.Limit != nil ||
-		ks.CooldownUntil != nil || ks.LastUsedAt != nil {
-		t.Fatalf("new key status = %+v, want untested with nil quota fields", ks)
+	// 新 key 从未测试过：冷却/最近使用未知为 null（额度字段已不进显示层）
+	if ks.Status != "untested" || ks.CooldownUntil != nil || ks.LastUsedAt != nil {
+		t.Fatalf("new key status = %+v, want untested with nil runtime fields", ks)
 	}
 
 	if err := s.SetKeyEnabled(added.ID, false); err != nil {
@@ -295,4 +297,95 @@ func TestDailyStatsUsesRecordTime(t *testing.T) {
 	if st.TotalRequests != 1 || st.RequestsToday > 0 {
 		t.Fatalf("stats = %+v, want total 1 / today 0", st)
 	}
+}
+
+// lastError 直接查库断言：KeyStatus（显示层）不暴露该列，自动禁用原因
+// 只存在 DB 里供排障。
+func lastError(t *testing.T, s *Store, id int64) sql.NullString {
+	t.Helper()
+	var le sql.NullString
+	if err := s.db.QueryRow(`SELECT last_error FROM keys WHERE id = ?`, id).Scan(&le); err != nil {
+		t.Fatalf("read last_error: %v", err)
+	}
+	return le
+}
+
+// 自动禁用：enabled=0 + last_error 记录原因；人工重新启用清空原因。
+func TestDisableKeyRecordsReason(t *testing.T) {
+	s := newTestStore(t)
+	added, err := s.AddKey("ctx7sk-disable-reason-01")
+	if err != nil {
+		t.Fatalf("AddKey: %v", err)
+	}
+	if err := s.DisableKey(added.ID, "invalid api key (auto-detected)"); err != nil {
+		t.Fatalf("DisableKey: %v", err)
+	}
+	keys, _ := s.ListKeys()
+	if keys[0].Enabled || keys[0].Status != "disabled" {
+		t.Fatalf("after disable = %+v, want enabled=false status=disabled", keys[0])
+	}
+	if le := lastError(t, s, added.ID); !le.Valid || le.String == "" {
+		t.Fatalf("last_error = %+v, want recorded reason", le)
+	}
+	if err := s.DisableKey(999, "x"); err != ErrKeyNotFound {
+		t.Fatalf("DisableKey missing err = %v, want ErrKeyNotFound", err)
+	}
+
+	// 人工重新启用：禁用原因失效，必须清空
+	if err := s.SetKeyEnabled(added.ID, true); err != nil {
+		t.Fatalf("SetKeyEnabled: %v", err)
+	}
+	if le := lastError(t, s, added.ID); le.Valid && le.String != "" {
+		t.Fatalf("last_error after re-enable = %q, want cleared", le.String)
+	}
+}
+
+// 老库（无 last_error 列）打开时自动补列：迁移幂等且 DisableKey 可用。
+func TestMigrateAddsLastErrorColumn(t *testing.T) {
+	path := t.TempDir() + "/legacy.db"
+	// 手工建老 schema：与现行 schema 的差异就是没有 last_error 列
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open legacy: %v", err)
+	}
+	const legacySchema = `CREATE TABLE keys (
+		id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT NOT NULL UNIQUE,
+		enabled INTEGER NOT NULL DEFAULT 1, remaining INTEGER, rate_limit INTEGER,
+		cooldown_until INTEGER, request_count INTEGER NOT NULL DEFAULT 0,
+		last_used_at INTEGER, added_at INTEGER NOT NULL);
+		CREATE TABLE stats_counters (id INTEGER PRIMARY KEY CHECK (id = 1),
+		total_requests INTEGER NOT NULL DEFAULT 0, cache_hits INTEGER NOT NULL DEFAULT 0);
+		INSERT OR IGNORE INTO stats_counters (id) VALUES (1);`
+	if _, err := db.Exec(legacySchema); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO keys (value, added_at) VALUES ('ctx7sk-legacy-key-0001', 0)`); err != nil {
+		t.Fatalf("seed legacy key: %v", err)
+	}
+	db.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open legacy store: %v", err)
+	}
+	defer s.Close()
+	added, err := s.GetKeyByID(1)
+	if err != nil || added.Value != "ctx7sk-legacy-key-0001" {
+		t.Fatalf("legacy key = (%v, %v), want preserved", added, err)
+	}
+	if err := s.DisableKey(1, "invalid api key (auto-detected)"); err != nil {
+		t.Fatalf("DisableKey on migrated store: %v", err)
+	}
+	if le := lastError(t, s, 1); !le.Valid || le.String == "" {
+		t.Fatalf("last_error after migration = %+v, want recorded", le)
+	}
+	// 二次 Open 验证迁移幂等（列已存在不报错）
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen migrated store: %v", err)
+	}
+	defer s2.Close()
 }

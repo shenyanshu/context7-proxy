@@ -20,18 +20,6 @@ import { fromNow } from '../format';
 import { keyStatusColor, keyStatusText } from '../keyStatusUi';
 import type { AddedKey, KeyList, KeyStatus, OkResponse } from '../types';
 
-/** 剩余额度列：未知时显式说明，避免用户误读为 0 */
-function quotaCell(k: KeyStatus) {
-  if (k.remaining === null || k.limit === null) {
-    return <Typography.Text type="secondary">未知</Typography.Text>;
-  }
-  return (
-    <span className="stat-num">
-      {k.remaining} / {k.limit}
-    </span>
-  );
-}
-
 function statusTag(status: KeyStatus['status']) {
   return <Tag color={keyStatusColor(status)}>{keyStatusText(status)}</Tag>;
 }
@@ -114,7 +102,6 @@ export function Keys() {
       align: 'right',
       render: (n: number) => <span className="stat-num">{n}</span>,
     },
-    { title: '剩余额度', key: 'quota', width: 140, render: (_, k) => quotaCell(k) },
     {
       title: '添加时间',
       dataIndex: 'addedAt',
@@ -190,7 +177,7 @@ export function Keys() {
             name="value"
             label="Context7 API Key"
             rules={[{ required: true, whitespace: true, message: '请粘贴 Key' }]}
-            extra="以 ctx7sk- 开头，添加后默认启用；额度与有效性在实际使用后自动更新。"
+            extra="以 ctx7sk- 开头，添加后默认启用；有效性在实际使用后自动更新。"
           >
             <Input.TextArea
               rows={3}

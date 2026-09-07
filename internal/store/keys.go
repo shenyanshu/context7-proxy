@@ -1,4 +1,4 @@
-// key 池的 CRUD 与额度状态持久化。KeyStatus 自用场景输出明文（用户确认），
+// key 池的 CRUD 与对外状态模型。KeyStatus 自用场景输出明文（用户确认），
 // 请求日志（RequestRecord.keyMasked）仍走脱敏。
 package store
 
@@ -33,16 +33,16 @@ func MaskedKey(value string) string {
 }
 
 // KeyStatus 是管理 API 对外模型，字段与 web/src/types.ts 的 KeyStatus 严格对齐：
-// remaining/limit/cooldownUntil/lastUsedAt 未知时为 nil。
+// cooldownUntil/lastUsedAt 未知时为 nil。
 // Value 输出完整 key 原文：用户确认的自用部署场景，管理界面需要明文核对；
 // RequestRecord.keyMasked（最近请求表）继续脱敏——那是紧凑标识列，两者语义不同。
+// remaining/rate_limit 只存在于 DB 列（内部调度用：REST 额度观测、余量归零
+// 主动冷却），不进对外模型——显示层已确认删除额度展示。
 type KeyStatus struct {
 	ID            int64  `json:"id"`
 	Value         string `json:"value"`
 	Enabled       bool   `json:"enabled"`
 	Status        string `json:"status"` // untested / active / cooldown / disabled
-	Remaining     *int64 `json:"remaining"`
-	Limit         *int64 `json:"limit"`
 	CooldownUntil *int64 `json:"cooldownUntil"`
 	RequestCount  int64  `json:"requestCount"`
 	LastUsedAt    *int64 `json:"lastUsedAt"`
@@ -107,9 +107,12 @@ func (s *Store) DeleteKey(id int64) error {
 	return nil
 }
 
-// SetKeyEnabled 启停 key，不存在返回 ErrKeyNotFound。
+// SetKeyEnabled 启停 key，不存在返回 ErrKeyNotFound。重新启用时清空
+// last_error——上次自动禁用的原因已随人工确认失效，保留会误导排障。
 func (s *Store) SetKeyEnabled(id int64, enabled bool) error {
-	res, err := s.db.Exec(`UPDATE keys SET enabled = ? WHERE id = ?`, enabled, id)
+	res, err := s.db.Exec(`UPDATE keys SET enabled = ?,
+		last_error = CASE WHEN ? THEN NULL ELSE last_error END WHERE id = ?`,
+		enabled, enabled, id)
 	if err != nil {
 		return err
 	}
@@ -123,10 +126,18 @@ func (s *Store) SetKeyEnabled(id int64, enabled bool) error {
 	return nil
 }
 
-// ListKeys 返回全部 key 的对外脱敏状态，按 ID 升序（稳定展示顺序）。
+// DisableKey 自动禁用 key 并记录原因（当前唯一调用方：MCP 透传层检测到
+// invalid api key）。与人工启停共用 enabled 字段，人工重新启用即清除原因。
+func (s *Store) DisableKey(id int64, reason string) error {
+	return s.updateKeyRow(`UPDATE keys SET enabled = 0, last_error = ? WHERE id = ?`,
+		reason, id)
+}
+
+// ListKeys 返回全部 key 的对外状态，按 ID 升序（稳定展示顺序）。
+// remaining/rate_limit 列不查出：调度内部数据不进显示层。
 func (s *Store) ListKeys() ([]KeyStatus, error) {
-	rows, err := s.db.Query(`SELECT id, value, enabled, remaining, rate_limit,
-		cooldown_until, request_count, last_used_at, added_at FROM keys ORDER BY id`)
+	rows, err := s.db.Query(`SELECT id, value, enabled, cooldown_until,
+		request_count, last_used_at, added_at FROM keys ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -142,26 +153,24 @@ func (s *Store) ListKeys() ([]KeyStatus, error) {
 	return out, rows.Err()
 }
 
-// scanKeyStatus 从行扫描脱敏状态并派生 status 字段。
+// scanKeyStatus 从行扫描对外状态并派生 status 字段。
 // status 与 cooldownUntil 用同一 now 判定：已到期的冷却不输出为 cooldown
 // 状态，且 cooldownUntil 输出 nil——两个字段口径一致，避免出现"状态 active
 // 但冷却值残留"的矛盾展示。
 func scanKeyStatus(row interface{ Scan(...any) error }) (KeyStatus, error) {
 	var (
-		ks                                       KeyStatus
-		value                                    string
-		enabled                                  int
-		remaining, rateLimit, cooldown, lastUsed sql.NullInt64
+		ks                 KeyStatus
+		value              string
+		enabled            int
+		cooldown, lastUsed sql.NullInt64
 	)
-	if err := row.Scan(&ks.ID, &value, &enabled, &remaining, &rateLimit,
+	if err := row.Scan(&ks.ID, &value, &enabled,
 		&cooldown, &ks.RequestCount, &lastUsed, &ks.AddedAt); err != nil {
 		return KeyStatus{}, err
 	}
 	now := time.Now().Unix()
 	ks.Value = value
 	ks.Enabled = enabled != 0
-	ks.Remaining = nullInt64(remaining)
-	ks.Limit = nullInt64(rateLimit)
 	ks.CooldownUntil = nullInt64(cooldown)
 	ks.LastUsedAt = nullInt64(lastUsed)
 	ks.Status = deriveStatus(ks, now)

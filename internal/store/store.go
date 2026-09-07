@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS keys (
 	cooldown_until INTEGER,
 	request_count  INTEGER NOT NULL DEFAULT 0,
 	last_used_at   INTEGER,
-	added_at       INTEGER NOT NULL
+	added_at       INTEGER NOT NULL,
+	last_error     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS cache (
@@ -113,12 +114,45 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate schema: %w", err)
 	}
+	// 老库补列：CREATE TABLE IF NOT EXISTS 不会更新已存在的表结构，
+	// last_error（自动禁用原因）需显式 ALTER 迁移，幂等
+	if err := migrateAddColumn(db, "keys", "last_error"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate keys.last_error: %w", err)
+	}
 	// WAL 附属文件在前面的写入后才出现，所以权限收紧放在迁移之后
 	if err := chmodPrivate(path); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return &Store{db: db}, nil
+}
+
+// migrateAddColumn 为老库幂等补列：PRAGMA table_info 检测列存在性，缺失
+// 则 ALTER TABLE ADD COLUMN（新库已由 schema 建出该列，此处天然跳过）。
+// table/column 只接受本包内具名常量调用，不构成注入面。
+func migrateAddColumn(db *sql.DB, table, column string) error {
+	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s TEXT", table, column))
+	return err
 }
 
 // ensurePrivateFile 确保 DB 文件存在且恰为 0600：

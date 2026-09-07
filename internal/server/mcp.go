@@ -115,6 +115,15 @@ func (s *Server) serveMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 白名单 tools/call 走缓冲路径：key 级错误检测（禁用/冷却+换 key
+	// 重试一次）+ 缓冲入缓存 + 原文写回（见 serveMCPCallRelayed）；其余
+	// 请求（GET 流订阅、通知、非白名单方法/工具）保持原透传路径，
+	// GET 的 SSE 流式语义不受影响
+	if meta != nil {
+		s.serveMCPCallRelayed(w, r, body, meta, start, keyID)
+		return
+	}
+
 	resp, usedKey, dErr := s.relayMCP(r, body, keyID, key)
 	if dErr != nil {
 		// 网络层失败与 REST 的 ErrUpstreamUnreachable 同映射 502
@@ -123,14 +132,6 @@ func (s *Server) serveMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
-
-	// 白名单 tools/call 的回源响应走缓冲路径：完整缓冲后写回原文并尝试
-	// 入缓存（见 serveMCPCallRelayed）；其余请求（GET 流订阅、通知、非
-	// 白名单方法/工具）保持原透传路径，GET 的 SSE 流式语义不受影响
-	if meta != nil {
-		s.serveMCPCallRelayed(w, resp, meta, tool, start, usedKey)
-		return
-	}
 
 	// 统计写失败让整次请求失败：与 REST 同口径，静默丢失会破坏对账
 	if rErr := s.recordMCPRequest(tool, start, resp.StatusCode, usedKey, false); rErr != nil {
@@ -146,11 +147,7 @@ func (s *Server) serveMCP(w http.ResponseWriter, r *http.Request) {
 // 返回最终响应与实际使用的 key ID。
 func (s *Server) relayMCP(r *http.Request, body []byte, keyID int64, key string) (*http.Response, int64, error) {
 	for attempt := 0; ; attempt++ {
-		req, err := s.buildMCPUpstreamRequest(r, body, key)
-		if err != nil {
-			return nil, keyID, fmt.Errorf("build MCP request: %w", err)
-		}
-		resp, err := mcpClient.Do(req)
+		resp, err := s.mcpUpstreamRoundTrip(r, body, key)
 		if err != nil {
 			return nil, keyID, err
 		}
@@ -172,6 +169,15 @@ func (s *Server) relayMCP(r *http.Request, body []byte, keyID int64, key string)
 		_ = resp.Body.Close()
 		keyID, key = nextID, nextKey
 	}
+}
+
+// mcpUpstreamRoundTrip 构造并发出一次上游请求。
+func (s *Server) mcpUpstreamRoundTrip(r *http.Request, body []byte, key string) (*http.Response, error) {
+	req, err := s.buildMCPUpstreamRequest(r, body, key)
+	if err != nil {
+		return nil, fmt.Errorf("build MCP request: %w", err)
+	}
+	return mcpClient.Do(req)
 }
 
 // buildMCPUpstreamRequest 构造上游请求：方法/路径固定，头复制自客户端

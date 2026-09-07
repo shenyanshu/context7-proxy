@@ -12,12 +12,21 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"context7-proxy/internal/store"
 )
 
 // mcpResolveCall 构造一条 resolve-library-id 的 tools/call 请求体。
 func mcpResolveCall(id int) string {
+	return mcpResolveCallWithLib(id, "React")
+}
+
+// mcpResolveCallWithLib 同 mcpResolveCall 但允许换 libraryName：
+// 变更参数即变更缓存键，用于绕开缓存命中。
+func mcpResolveCallWithLib(id int, library string) string {
 	return `{"jsonrpc":"2.0","id":` + strconv.Itoa(id) +
-		`,"method":"tools/call","params":{"name":"resolve-library-id","arguments":{"libraryName":"React","query":"hooks"}}}`
+		`,"method":"tools/call","params":{"name":"resolve-library-id","arguments":{"libraryName":"` +
+		library + `","query":"hooks"}}}`
 }
 
 // mcpCallResultJSON 标准成功结果体（tools/call 的 result 载荷）。
@@ -393,5 +402,209 @@ func TestMCPCallCacheTTLExpiry(t *testing.T) {
 	id4, _ := decodeJSONRPC(t, got4)
 	if string(id4) != "4" {
 		t.Fatalf("post-re-cache id = %s, want 4 (cache hit reframes id)", id4)
+	}
+}
+
+// —— key 级错误检测 + 换 key 重试（本批增强）——
+
+// mcpIsErrorJSONRPC 构造 isError 的 JSON-RPC 成功响应（HTTP 200 + 文案）：
+// 参数是完整响应消息，调用方直接整条写出。
+func mcpIsErrorJSONRPC(text string) string {
+	return `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":` +
+		strconv.Quote(text) + `}],"isError":true}}`
+}
+
+// keyQuotaFailureScenario 组装按 Bearer 区分 keyA/keyB 行为的假上游：
+// keyA 恒定返回错误文案，keyB 恒定返回成功。返回记录两个 key 各自被调用
+// 次数的闭包。
+func keyQuotaFailureScenario(errText string) (http.HandlerFunc, func() (a, b int)) {
+	var mu sync.Mutex
+	hitsA, hitsB := 0, 0
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		isA := strings.HasSuffix(r.Header.Get("Authorization"), "keya-aaaaaa")
+		if isA {
+			hitsA++
+		} else {
+			hitsB++
+		}
+		mu.Unlock()
+		if isA {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(mcpIsErrorJSONRPC(errText)))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":` + mcpCallResultJSON + `}`))
+	}
+	counts := func() (int, int) {
+		mu.Lock()
+		defer mu.Unlock()
+		return hitsA, hitsB
+	}
+	return handler, counts
+}
+
+// 额度类错误（rate limit）：keyA 报错 → 冷却 10 分钟 → 换 keyB 重试成功；
+// 客户端拿到 keyB 的成功响应；缓存入的是成功响应（第二次调用命中缓存，
+// 上游零新增）；keyA 处于冷却。
+func TestMCPQuotaErrorCooldownAndRetry(t *testing.T) {
+	handler, counts := keyQuotaFailureScenario("Rate limit exceeded. Try again later.")
+	f := newMCPFixture(t, handler)
+	addTestKey(t, f.st, "ctx7sk-keya-aaaaaa")
+	addTestKey(t, f.st, "ctx7sk-keyb-bbbbbb")
+
+	res := f.mcpDo(http.MethodPost, mcpResolveCall(1), nil)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (retried on second key)", res.StatusCode)
+	}
+	got, _ := io.ReadAll(res.Body)
+	_, result := decodeJSONRPC(t, got)
+	if string(result) != mcpCallResultJSON {
+		t.Fatalf("client result = %s, want second key's success (not the error)", result)
+	}
+	if a, b := counts(); a != 1 || b != 1 {
+		t.Fatalf("upstream hits keyA/keyB = %d/%d, want 1/1 (error then retry)", a, b)
+	}
+
+	// keyA 冷却落盘（10 分钟固定），keyB 不受影响
+	keys, err := f.st.ListKeys()
+	if err != nil || len(keys) != 2 {
+		t.Fatalf("ListKeys = %v (err %v)", keys, err)
+	}
+	var keyA, keyB store.KeyStatus
+	for _, k := range keys {
+		if strings.Contains(k.Value, "keya") {
+			keyA = k
+		} else {
+			keyB = k
+		}
+	}
+	if keyA.Status != "cooldown" || keyA.CooldownUntil == nil {
+		t.Fatalf("keyA status = %s/%v, want cooldown with future until", keyA.Status, keyA.CooldownUntil)
+	}
+	if keyB.Status == "cooldown" {
+		t.Fatalf("keyB must not be cooled: %+v", keyB)
+	}
+
+	// 第二次同参调用：命中的是重试成功后入缓存的成功响应，上游零新增
+	res2 := f.mcpDo(http.MethodPost, mcpResolveCall(2), nil)
+	defer res2.Body.Close()
+	if a, b := counts(); a != 1 || b != 1 {
+		t.Fatalf("upstream hits after cache = %d/%d, want unchanged 1/1", a, b)
+	}
+	got2, _ := io.ReadAll(res2.Body)
+	_, result2 := decodeJSONRPC(t, got2)
+	if string(result2) != mcpCallResultJSON {
+		t.Fatalf("cached result = %s, want success result (error attempt must not cache)", result2)
+	}
+}
+
+// 无效 key 错误：keyA 被自动禁用（enabled=false + last_error 落盘）并换
+// key 重试成功；后续调度永远不再选 keyA。
+func TestMCPInvalidKeyDisableAndRetry(t *testing.T) {
+	handler, counts := keyQuotaFailureScenario("Invalid API key provided")
+	f := newMCPFixture(t, handler)
+	addTestKey(t, f.st, "ctx7sk-keya-aaaaaa")
+	addTestKey(t, f.st, "ctx7sk-keyb-bbbbbb")
+
+	res := f.mcpDo(http.MethodPost, mcpResolveCall(1), nil)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (retried on second key)", res.StatusCode)
+	}
+	got, _ := io.ReadAll(res.Body)
+	_, result := decodeJSONRPC(t, got)
+	if string(result) != mcpCallResultJSON {
+		t.Fatalf("client result = %s, want second key's success", result)
+	}
+
+	keys, err := f.st.ListKeys()
+	if err != nil {
+		t.Fatalf("ListKeys: %v", err)
+	}
+	for _, k := range keys {
+		if strings.Contains(k.Value, "keya") {
+			if k.Enabled || k.Status != "disabled" {
+				t.Fatalf("keyA = %+v, want enabled=false status=disabled (auto)", k)
+			}
+		}
+	}
+
+	// 新参数（绕开缓存）再打：keyA 已禁用，只可能打 keyB
+	res2 := f.mcpDo(http.MethodPost, mcpResolveCallWithLib(3, "Other"), nil)
+	res2.Body.Close()
+	if a, b := counts(); a != 1 || b != 2 {
+		t.Fatalf("upstream hits = %d/%d, want keyA frozen at 1 (disabled)", a, b)
+	}
+}
+
+// 两个 key 都报额度错误：keyA 报错冷却→换 keyB→keyB 也报错（重试额度
+// 用尽）→ 客户端拿到最后一次（keyB）的错误响应原样；两个 key 都冷却。
+func TestMCPQuotaErrorAllKeysFail(t *testing.T) {
+	const errBody = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"Rate limit exceeded. Try again later."}],"isError":true}}`
+	f := newMCPFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(errBody))
+	})
+	addTestKey(t, f.st, "ctx7sk-keya-aaaaaa")
+	addTestKey(t, f.st, "ctx7sk-keyb-bbbbbb")
+
+	res := f.mcpDo(http.MethodPost, mcpResolveCall(1), nil)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 passthrough", res.StatusCode)
+	}
+	got, _ := io.ReadAll(res.Body)
+	if string(got) != errBody {
+		t.Fatalf("client body = %s, want last upstream error passthrough verbatim", got)
+	}
+	// 失败响应绝不入缓存：同参（换 id）再打仍完整回源。第一轮冷却了
+	// keyA，第二轮只剩 keyB 可选——恰 1 跳且 keyB 再次报错被冷却
+	res2 := f.mcpDo(http.MethodPost, mcpResolveCall(2), nil)
+	res2.Body.Close()
+	if _, bodies, _ := f.upstreamCalls(); len(bodies) != 3 {
+		t.Fatalf("upstream calls = %d, want 3 (round1: 2 keys; round2: only keyB left)", len(bodies))
+	}
+	keys, err := f.st.ListKeys()
+	if err != nil {
+		t.Fatalf("ListKeys: %v", err)
+	}
+	for _, k := range keys {
+		if k.Status != "cooldown" {
+			t.Fatalf("key %s status = %s, want cooldown", k.Value, k.Status)
+		}
+	}
+}
+
+// 不匹配任何模式的业务错误（library not found）：直接透传不重试、上游
+// 恰被打 1 次、key 不被处置。
+func TestMCPUnknownErrorPassthrough(t *testing.T) {
+	const errBody = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"library not found"}],"isError":true}}`
+	f := newMCPFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(errBody))
+	})
+	addTestKey(t, f.st, "ctx7sk-keya-aaaaaa")
+	addTestKey(t, f.st, "ctx7sk-keyb-bbbbbb")
+
+	res := f.mcpDo(http.MethodPost, mcpResolveCall(1), nil)
+	defer res.Body.Close()
+	got, _ := io.ReadAll(res.Body)
+	if string(got) != errBody {
+		t.Fatalf("client body = %s, want verbatim passthrough", got)
+	}
+	if _, bodies, _ := f.upstreamCalls(); len(bodies) != 1 {
+		t.Fatalf("upstream calls = %d, want 1 (no retry on non-key error)", len(bodies))
+	}
+	keys, err := f.st.ListKeys()
+	if err != nil {
+		t.Fatalf("ListKeys: %v", err)
+	}
+	for _, k := range keys {
+		if k.Status == "cooldown" || k.Status == "disabled" {
+			t.Fatalf("key %s must stay untouched: %+v", k.Value, k)
+		}
 	}
 }

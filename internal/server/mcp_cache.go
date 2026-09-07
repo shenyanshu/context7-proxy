@@ -123,33 +123,183 @@ func writeMCPCacheHit(w http.ResponseWriter, id json.RawMessage, result []byte) 
 	_, _ = w.Write(buf.Bytes())
 }
 
+// MCP key 级错误约束常量。
+const (
+	// mcpQuotaCooldown 额度类错误无库内 reset 时刻可用时的固定冷却时长
+	mcpQuotaCooldown = 10 * time.Minute
+	// mcpMaxKeyRetries 缓冲路径检测到 key 级错误后的换 key 重试上限（1 次）
+	mcpMaxKeyRetries = 1
+)
+
+// mcpInvalidKeyPatterns "invalid api key" 类文案：命中即自动禁用该 key——
+// 这类错误对该 key 是永久性的，继续调度只会白白烧请求。
+var mcpInvalidKeyPatterns = []string{"invalid api key"}
+
+// mcpQuotaErrorPatterns 额度/限流类文案：命中即冷却该 key 后换 key 重试。
+// 依赖官方错误文案做子串匹配是脆弱的耦合：官方改文案时这里退化为普通错误
+// 透传（fail-open），不会误禁用/误冷却，最坏只是少救活一次请求。
+var mcpQuotaErrorPatterns = []string{"rate limit", "ratelimit", "quota", "too many requests", "429"}
+
+// mcpCallFailure 提取出的 key 级错误分类。
+type mcpCallFailure int
+
+const (
+	// mcpNoKeyFailure 非 key 级错误（或非 isError）：不处置直接透传
+	mcpNoKeyFailure mcpCallFailure = iota
+	// mcpFailureInvalidKey key 无效：禁用 + 可重试
+	mcpFailureInvalidKey
+	// mcpFailureQuota 额度/限流：冷却 + 可重试
+	mcpFailureQuota
+)
+
+// classifyMCPCallFailure 对已缓冲的 tools/call 响应做 key 级错误分类：
+// JSON-RPC result.isError==true 时取全部 text content 做不区分大小写子串
+// 匹配。官方 MCP 网关的限流/鉴权失败表现为 HTTP 200 + isError 文案
+// （观察所得），HTTP 状态层的失败仍由 relayMCP 的 429 分支处理。
+func classifyMCPCallFailure(contentType string, buf []byte) mcpCallFailure {
+	m := parseMCPJSONRPCMessage(contentType, buf)
+	if m == nil || m.Result == nil {
+		return mcpNoKeyFailure // 无 result / JSON-RPC error / 解析失败：不处置
+	}
+	var content struct {
+		IsError bool `json:"isError"`
+	}
+	if err := json.Unmarshal(m.Result, &content); err != nil || !content.IsError {
+		return mcpNoKeyFailure
+	}
+	text := strings.ToLower(mcpCallTextContent(m.Result))
+	for _, p := range mcpInvalidKeyPatterns {
+		if strings.Contains(text, p) {
+			return mcpFailureInvalidKey
+		}
+	}
+	for _, p := range mcpQuotaErrorPatterns {
+		if strings.Contains(text, p) {
+			return mcpFailureQuota
+		}
+	}
+	return mcpNoKeyFailure
+}
+
+// mcpCallTextContent 提取 result.content 里全部 text 项的拼接文本：
+// 错误文案可能跨多个 content 块，逐块拼接避免漏检。
+func mcpCallTextContent(result []byte) string {
+	var content struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(result, &content); err != nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, c := range content.Content {
+		if c.Type == "text" {
+			sb.WriteString(c.Text)
+			sb.WriteByte(' ')
+		}
+	}
+	return sb.String()
+}
+
 // serveMCPCallRelayed 处理白名单 tools/call 的回源响应：完整缓冲（SSE
 // 形态同样缓冲——单次 tools/call 的 SSE 流终会终止，不存在长连接订阅
-// 语义）→ 200 且解析出非 isError 的 result 时写共享缓存 → 记账 → 原始
-// 字节整块写回客户端，保持透传真度。缓存写失败与 REST 同口径让整次请求
-// 失败：静默丢失会让“哪些响应实际入了缓存”不可对账。
-func (s *Server) serveMCPCallRelayed(w http.ResponseWriter, resp *http.Response, meta *mcpCallMeta, tool string, start time.Time, keyID int64) {
-	buf, rErr := io.ReadAll(io.LimitReader(resp.Body, maxMCPResponseBytes+1))
-	if rErr != nil || len(buf) > maxMCPResponseBytes {
-		// 响应尚未写给客户端，可以干净地 502，优于流式路径的截断 200
-		_ = s.recordMCPRequest(tool, start, http.StatusBadGateway, keyID, false)
-		writeJSONError(w, http.StatusBadGateway, "upstream unavailable")
-		return
-	}
-	if resp.StatusCode == http.StatusOK {
+// 语义）→ key 级错误检测（无效 key 禁用 / 额度类冷却，各最多换 1 个 key
+// 重试一次）→ 200 且解析出非 isError 的 result 时写共享缓存 → 记账 →
+// 原始字节整块写回客户端，保持透传真度。失败尝试的响应绝不入缓存；无 key
+// 可换或重试仍失败时把最后一次的上游响应原样返回（fail-open，不构造新
+// 错误）。缓存写失败与 REST 同口径让整次请求失败：静默丢失会让"哪些响应
+// 实际入了缓存"不可对账。
+func (s *Server) serveMCPCallRelayed(w http.ResponseWriter, r *http.Request, body []byte, meta *mcpCallMeta, start time.Time, keyID int64) {
+	resp, keyID, buf, failure := s.relayMCPCallWithKeyRetry(r, body, keyID)
+	defer resp.Body.Close()
+	if failure == mcpNoKeyFailure && resp.StatusCode == http.StatusOK {
 		if result, ok := extractMCPCallResult(resp.Header.Get("Content-Type"), buf); ok {
 			if cErr := s.store.SetCache(meta.cacheKey, result, "application/json", s.query.CacheTTL()); cErr != nil {
-				_ = s.recordMCPRequest(tool, start, http.StatusInternalServerError, keyID, false)
 				writeJSONError(w, http.StatusInternalServerError, "internal error")
 				return
 			}
 		}
 	}
-	if rErr := s.recordMCPRequest(tool, start, resp.StatusCode, keyID, false); rErr != nil {
+	if rErr := s.recordMCPRequest(meta.tool, start, resp.StatusCode, keyID, false); rErr != nil {
 		writeJSONError(w, http.StatusInternalServerError, "log request failed")
 		return
 	}
 	writeMCPBufferedResponse(w, resp, buf)
+}
+
+// relayMCPCallWithKeyRetry 执行带 key 级错误重试的缓冲转发：逐跳"转发
+// （含 429 换 key）→ 缓冲 → 检测"，检测到可重试的 key 级错误时处置该 key
+// 并换 key 重发同一请求体至多一次。返回最终响应、实际服务的 key、缓冲体
+// 与最终跳的错误分类。网络失败/超限等无法判定 key 责任的情况一律 502
+// 合成响应，不重试。
+func (s *Server) relayMCPCallWithKeyRetry(r *http.Request, body []byte, keyID int64) (*http.Response, int64, []byte, mcpCallFailure) {
+	for attempt := 0; ; attempt++ {
+		key, gErr := s.keyValue(keyID)
+		if gErr != nil {
+			return mcpGatewayErrorResponse(), keyID, nil, mcpNoKeyFailure
+		}
+		resp, respKey, dErr := s.relayMCP(r, body, keyID, key)
+		if dErr != nil {
+			return mcpGatewayErrorResponse(), keyID, nil, mcpNoKeyFailure
+		}
+		keyID = respKey
+		buf, rErr := io.ReadAll(io.LimitReader(resp.Body, maxMCPResponseBytes+1))
+		resp.Body.Close()
+		if rErr != nil || len(buf) > maxMCPResponseBytes {
+			return mcpGatewayErrorResponse(), keyID, nil, mcpNoKeyFailure
+		}
+		failure := classifyMCPCallFailure(resp.Header.Get("Content-Type"), buf)
+		if failure == mcpNoKeyFailure || attempt >= mcpMaxKeyRetries {
+			return resp, keyID, buf, failure
+		}
+		if !s.handleMCPKeyFailure(failure, keyID) {
+			return resp, keyID, buf, failure // 落盘失败：池状态未知，不重试
+		}
+		nextID, _, pErr := s.query.PickProxyKey()
+		if pErr != nil {
+			return resp, keyID, buf, failure // 无 key 可换：最后一跳原样返回
+		}
+		keyID = nextID
+	}
+}
+
+// keyValue 取 key 原文：重试跳的 key 由 ID 反查（首轮 key 从调度选出后
+// 只传 ID，统一反查口径，避免两套参数传递形态）。
+func (s *Server) keyValue(keyID int64) (string, error) {
+	k, err := s.store.GetKeyByID(keyID)
+	if err != nil {
+		return "", err
+	}
+	return k.Value, nil
+}
+
+// mcpGatewayErrorResponse 合成 502 网关错误响应：缓冲路径读体失败时尚未
+// 向客户端写任何字节，用合成响应统一"网络层失败"的返回形态，头与体和
+// writeJSONError 的 502 契约一致。
+func mcpGatewayErrorResponse() *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusBadGateway,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(bytes.NewReader([]byte(`{"error":"upstream unavailable"}`))),
+	}
+}
+
+// handleMCPKeyFailure 落盘处置失败的 key：禁用（invalid api key）或冷却
+// （额度类，固定 10 分钟——DB 无额度重置时刻可用，见 mcpQuotaCooldown）。
+// 落盘失败返回 false——池状态未知时宁可把错误透传给客户端，
+// 也不在未确认的池状态上继续换 key 重试。
+func (s *Server) handleMCPKeyFailure(failure mcpCallFailure, keyID int64) bool {
+	switch failure {
+	case mcpFailureInvalidKey:
+		return s.store.DisableKey(keyID, "invalid api key (auto-detected)") == nil
+	case mcpFailureQuota:
+		until := time.Now().Add(mcpQuotaCooldown).Unix()
+		return s.store.CooldownKey(keyID, until) == nil
+	default:
+		return false
+	}
 }
 
 // writeMCPBufferedResponse 把已缓冲的完整上游响应写回客户端：头剥离规则
@@ -167,40 +317,51 @@ func writeMCPBufferedResponse(w http.ResponseWriter, resp *http.Response, body [
 	_, _ = w.Write(body)
 }
 
-// extractMCPCallResult 从缓冲的响应体提取 tools/call 的 JSON-RPC result：
-// SSE 形态逐条解析 data: 行的 JSON 消息，纯 JSON 形态整体解析。result
-// 存在且 isError 非真才可缓存；出现 JSON-RPC error 或任一解析失败一律
-// 保守放弃（宁少勿错：错误缓存的危害远大于少缓存一次）。
-func extractMCPCallResult(contentType string, body []byte) (json.RawMessage, bool) {
+// mcpJSONRPCMessage 是单条已解析的 JSON-RPC 消息（result/error 均为可选）。
+type mcpJSONRPCMessage struct {
+	Result json.RawMessage `json:"result"`
+	Error  json.RawMessage `json:"error"`
+}
+
+// parseMCPJSONRPCMessage 解析缓冲体中的首条 JSON-RPC 消息：SSE 形态逐条
+// 尝试 data: 行，纯 JSON 形态整体解析。任一消息无法解析返回 nil，调用方
+// （缓存/分类）各自保守处置。
+func parseMCPJSONRPCMessage(contentType string, body []byte) *mcpJSONRPCMessage {
 	messages := [][]byte{body}
 	if strings.HasPrefix(contentType, contentTypeSSE) {
 		messages = sseDataMessages(body)
 	}
 	for _, msg := range messages {
-		var m struct {
-			Result json.RawMessage `json:"result"`
-			Error  json.RawMessage `json:"error"`
+		if len(msg) == 0 {
+			continue
 		}
-		if err := json.Unmarshal(msg, &m); err != nil {
-			return nil, false
+		m := new(mcpJSONRPCMessage)
+		if err := json.Unmarshal(msg, m); err != nil {
+			return nil
 		}
-		if len(m.Error) > 0 && string(m.Error) != "null" {
-			return nil, false
-		}
-		if len(m.Result) > 0 && string(m.Result) != "null" {
-			var content struct {
-				IsError bool `json:"isError"`
-			}
-			if err := json.Unmarshal(m.Result, &content); err != nil {
-				return nil, false
-			}
-			if content.IsError {
-				return nil, false
-			}
-			return m.Result, true
-		}
+		return m
 	}
-	return nil, false
+	return nil
+}
+
+// extractMCPCallResult 从缓冲的响应体提取可缓存的 tools/call result：
+// result 存在且 isError 非真才返回；JSON-RPC error 或任一解析失败一律
+// 保守放弃（宁少勿错：错误缓存的危害远大于少缓存一次）。
+func extractMCPCallResult(contentType string, body []byte) (json.RawMessage, bool) {
+	m := parseMCPJSONRPCMessage(contentType, body)
+	if m == nil || m.Result == nil || string(m.Result) == "null" {
+		return nil, false
+	}
+	if len(m.Error) > 0 && string(m.Error) != "null" {
+		return nil, false
+	}
+	var content struct {
+		IsError bool `json:"isError"`
+	}
+	if err := json.Unmarshal(m.Result, &content); err != nil || content.IsError {
+		return nil, false
+	}
+	return m.Result, true
 }
 
 // sseDataMessages 提取 SSE 流里全部 data: 行的载荷。MCP streamable HTTP
