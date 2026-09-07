@@ -1,0 +1,41 @@
+# CI 常规门禁：主干 push 与所有 PR 上跑 Go 检查/测试和前端类型检查/构建。
+# 镜像构建不在此处（见 docker.yml）——测试与发布职责分离，互不拖慢。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # gofmt 有任何输出即失败：格式问题不等到 review 才发现
+      - name: gofmt 检查
+        run: test -z "$(gofmt -l cmd internal web)"
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      # tsc -b && vite build：类型错误在 CI 拦截，不带病发版
+      - run: npm run build

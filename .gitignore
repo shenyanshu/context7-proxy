@@ -1,0 +1,17 @@
+# Go 构建产物与本地状态
+/tmp/
+*.test
+
+# 前端：依赖与构建产物（Docker/CI 阶段内构建，不入库）
+web/node_modules/
+web/dist/
+
+# 运行时数据：SQLite 内含真实上游 key 原文，绝不能进版本库
+data/
+
+# 系统杂项
+.DS_Store
+
+# IDE
+.idea/
+.vscode/

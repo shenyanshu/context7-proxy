@@ -1,0 +1,10 @@
+# 目标是缩小构建上下文与防止本地产物混入镜像：
+# 源码进镜像由 Dockerfile 的精确 COPY 路径控制，此处只挡体积大头与
+# 会污染构建的本地状态。
+web/node_modules
+web/dist
+data
+.git
+.github
+.DS_Store
+*.test

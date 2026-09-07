@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/api.ts","./src/format.ts","./src/keystatusui.ts","./src/main.tsx","./src/types.ts","./src/components/cooldownclock.tsx","./src/components/keycard.tsx","./src/components/requeststable.tsx","./src/components/statsrow.tsx","./src/views/dashboard.tsx","./src/views/keys.tsx","./src/views/login.tsx"],"version":"5.6.3"}
