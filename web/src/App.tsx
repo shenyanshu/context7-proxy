@@ -1,7 +1,13 @@
-import { DashboardOutlined, KeyOutlined, LogoutOutlined } from '@ant-design/icons';
+import {
+  DashboardOutlined,
+  DatabaseOutlined,
+  KeyOutlined,
+  LogoutOutlined,
+} from '@ant-design/icons';
 import { Layout, Menu, Tabs, Typography } from 'antd';
 import { Navigate, Outlet, Route, Routes, useNavigate, useSearchParams } from 'react-router-dom';
 import { KEY_STORAGE } from './api';
+import { Cache } from './views/Cache';
 import { Dashboard } from './views/Dashboard';
 import { Keys } from './views/Keys';
 import { Login } from './views/Login';
@@ -25,11 +31,16 @@ function useLogout() {
 
 const TAB_DASHBOARD = 'dashboard';
 const TAB_KEYS = 'keys';
+const TAB_CACHE = 'cache';
 
-/** 主框架：侧边两项导航 + 顶部标题栏，右侧内容按 tab 切换 */
+// 非法 tab 值一律回落到仪表盘，避免旧链接或手改 URL 造成空白页
+const VALID_TABS = new Set([TAB_KEYS, TAB_CACHE]);
+
+/** 主框架：侧边导航 + 顶部标题栏，右侧内容按 tab 切换 */
 function AdminLayout() {
   const [params, setParams] = useSearchParams();
-  const tab = params.get('tab') === TAB_KEYS ? TAB_KEYS : TAB_DASHBOARD;
+  const raw = params.get('tab') ?? '';
+  const tab = VALID_TABS.has(raw) ? raw : TAB_DASHBOARD;
   const logout = useLogout();
 
   const switchTab = (key: string) => {
@@ -50,6 +61,7 @@ function AdminLayout() {
           items={[
             { key: TAB_DASHBOARD, icon: <DashboardOutlined />, label: '仪表盘' },
             { key: TAB_KEYS, icon: <KeyOutlined />, label: 'Key 管理' },
+            { key: TAB_CACHE, icon: <DatabaseOutlined />, label: '缓存' },
           ]}
         />
       </Layout.Sider>
@@ -65,6 +77,7 @@ function AdminLayout() {
             items={[
               { key: TAB_DASHBOARD, label: '仪表盘' },
               { key: TAB_KEYS, label: 'Key 管理' },
+              { key: TAB_CACHE, label: '缓存' },
             ]}
           />
           <span
@@ -79,7 +92,7 @@ function AdminLayout() {
         </Layout.Header>
 
         <Layout.Content className="admin-content">
-          {tab === TAB_DASHBOARD ? <Dashboard /> : <Keys />}
+          {tab === TAB_KEYS ? <Keys /> : tab === TAB_CACHE ? <Cache /> : <Dashboard />}
         </Layout.Content>
       </Layout>
     </Layout>

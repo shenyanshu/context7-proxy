@@ -52,6 +52,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/admin/keys/{id}", s.handleSetKeyEnabled)
 	mux.HandleFunc("DELETE /api/admin/keys/{id}", s.handleDeleteKey)
 
+	// 缓存查看（只读）：列表不含 body；{key...} 承接含 ?/&/:/{} 的缓存键
+	mux.HandleFunc("GET /api/admin/cache", s.handleListCache)
+	mux.HandleFunc("GET /api/admin/cache/{key...}", s.handleCacheDetail)
+
 	// SPA 静态：/admin 精确命中 301 规范化到 /admin/（前端是相对 base，
 	// 无尾斜杠时 ./assets 会解析到 /assets 而 404）；/admin/{path...}
 	// 覆盖带斜杠的全部子路径（含 /admin/ 本身），HashRouter 无需 history rewrite

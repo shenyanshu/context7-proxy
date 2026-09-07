@@ -38,6 +38,19 @@ type okDTO struct {
 	OK bool `json:"ok"`
 }
 
+// cacheListDTO 是 /api/admin/cache 的列表契约（不含 body，轻量）。
+type cacheListDTO struct {
+	Entries []store.CacheListEntry `json:"entries"`
+}
+
+// cacheDetailDTO 是 /api/admin/cache/{key...} 的详情契约：
+// body 为响应体原文字符串（JSON 或纯文本均不解析不转换）。
+type cacheDetailDTO struct {
+	Key         string `json:"key"`
+	ContentType string `json:"contentType"`
+	Body        string `json:"body"`
+}
+
 func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.store.GetStats()
 	if err != nil {
@@ -152,6 +165,36 @@ func (s *Server) handleDeleteKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, okDTO{OK: true})
+}
+
+// handleListCache 列出全部未过期缓存条目（不含 body）。
+func (s *Server) handleListCache(w http.ResponseWriter, r *http.Request) {
+	entries, err := s.store.ListCacheEntries()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "list cache failed")
+		return
+	}
+	if entries == nil {
+		entries = []store.CacheListEntry{}
+	}
+	writeJSON(w, http.StatusOK, cacheListDTO{Entries: entries})
+}
+
+// handleCacheDetail 取单条缓存原文。前端用 encodeURIComponent 编码整个
+// 缓存键（REST 键的 ?/&、MCP 键的冒号花括号都会被转义），ServeMux 通配符
+// {key...} 解码后 PathValue 拿到的即缓存键原文，直接当 hash 查。
+func (s *Server) handleCacheDetail(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	body, contentType, err := s.store.GetCacheEntryDetail(key)
+	if err != nil {
+		if errors.Is(err, store.ErrCacheMiss) {
+			writeJSONError(w, http.StatusNotFound, "cache entry not found")
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "read cache entry failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, cacheDetailDTO{Key: key, ContentType: contentType, Body: string(body)})
 }
 
 // pathID 解析路径通配符 {id}：非数字 400，调用方据此短路。

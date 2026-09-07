@@ -22,7 +22,9 @@ export function Login() {
       navigate('/', { replace: true });
     } catch (e) {
       localStorage.removeItem(KEY_STORAGE);
-      setError(e instanceof Error && e.message ? e.message : '验证失败，请确认 Master Key 是否正确');
+      setError(
+        e instanceof Error && e.message ? e.message : '验证失败，请确认 Master Key 是否正确',
+      );
     } finally {
       setLoading(false);
     }

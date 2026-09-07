@@ -363,7 +363,8 @@ func TestMCPGetDeletePassthrough(t *testing.T) {
 	}
 }
 
-// 记账：tools/call 的 Path 记工具名，其余记 /mcp；字段与 REST 同规则。
+// 记账：tools/call 的 Path 记工具名并计入统计；协议开销流量（tools/list
+// 等解析不出工具名的请求）零额度消耗，不产生日志也不计入 totalRequests。
 func TestMCPRecordRequest(t *testing.T) {
 	f := newMCPFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -371,22 +372,20 @@ func TestMCPRecordRequest(t *testing.T) {
 	})
 	addTestKey(t, f.st, "ctx7sk-mcpstat-010")
 
+	list := f.mcpDo(http.MethodPost, mcpToolsListBody, nil)
+	list.Body.Close()
+	list2 := f.mcpDo(http.MethodPost, mcpToolsListBody, nil)
+	list2.Body.Close()
 	call := f.mcpDo(http.MethodPost,
 		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"resolve-library-id","arguments":{"libraryName":"React","query":"hooks"}}}`,
 		nil)
 	call.Body.Close()
-	list := f.mcpDo(http.MethodPost, mcpToolsListBody, nil)
-	list.Body.Close()
 
 	recs, err := f.st.RecentRequests()
-	if err != nil || len(recs) != 2 {
-		t.Fatalf("recent requests = %d (err %v), want 2", len(recs), err)
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("recent requests = %d (err %v), want 1 (tools/list not recorded)", len(recs), err)
 	}
-	// 新的在前：第一条是 tools/list（Path 回退 /mcp），第二条是 tools/call
-	if recs[0].Method != methodMCP || recs[0].Path != mcpPath {
-		t.Fatalf("tools/list record = %q/%q, want MCP//mcp", recs[0].Method, recs[0].Path)
-	}
-	rec := recs[1]
+	rec := recs[0]
 	if rec.Method != "MCP" || rec.Path != "resolve-library-id" {
 		t.Fatalf("tools/call record method/path = %q/%q, want MCP/resolve-library-id", rec.Method, rec.Path)
 	}
@@ -398,6 +397,12 @@ func TestMCPRecordRequest(t *testing.T) {
 	}
 	if rec.DurationMs < 1 {
 		t.Fatalf("record durationMs = %d, want >= 1", rec.DurationMs)
+	}
+
+	// 统计口径：两发 tools/list 不进分母，totalRequests 只含 tools/call 那 1 条
+	st, err := f.st.GetStats()
+	if err != nil || st.TotalRequests != 1 {
+		t.Fatalf("totalRequests = %d (err %v), want 1 (only the tools/call)", st.TotalRequests, err)
 	}
 }
 

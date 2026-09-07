@@ -16,6 +16,22 @@ export function fullTime(unixSec: number): string {
   return dayjs.unix(unixSec).format('HH:mm:ss');
 }
 
+/** Tooltip 等需要精确到日的完整时刻 */
+export function fullDateTime(unixSec: number): string {
+  return dayjs.unix(unixSec).format('YYYY-MM-DD HH:mm:ss');
+}
+
+/** 字节数人性化：B 取整、KB/MB 保留 1 位小数，统一在此维护避免各处自写换算 */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
 /** 冷却倒计时，单位秒；非正数截断为 0，由调用方决定是否渲染 */
 export function formatCountdown(seconds: number): string {
   const total = Math.max(0, Math.ceil(seconds));

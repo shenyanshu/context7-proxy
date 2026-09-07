@@ -300,7 +300,14 @@ func mcpToolName(body []byte) string {
 // 上游状态（无 key 503 / 网络失败 502 照实）。缓存命中时 Cached=true 且
 // 不记 key 字段——命中路径不消耗池内 key；KeyID/KeyMasked 的留空口径
 // 与 REST 的 handleQuery 一致。
+// 统计口径：协议开销流量（tools/list/initialize/通知，即解析不出工具名、
+// Path 回退 /mcp 的请求）零额度消耗，计入统计会虚增总请求量并稀释缓存
+// 命中率，一律跳过。stats 表历史数据不迁移——旧数据含少量协议流量，
+// 口径切换从本版生效，误差只减不增。
 func (s *Server) recordMCPRequest(tool string, start time.Time, status int, keyID int64, cached bool) error {
+	if tool == mcpPath {
+		return nil
+	}
 	record := store.RequestRecord{
 		Time:       start.Unix(),
 		Method:     methodMCP,

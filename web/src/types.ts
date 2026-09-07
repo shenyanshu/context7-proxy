@@ -53,3 +53,23 @@ export interface OkResponse {
 export interface ErrorResponse {
   error: string;
 }
+
+/** 缓存条目：key 为可读原文，REST 形如 /api/v2/...，MCP 形如 mcp:...:{json} */
+export interface CacheEntry {
+  key: string;
+  /** 字节数 */
+  size: number;
+  contentType: string;
+  /** 过期时间（Unix 秒） */
+  expiresAt: number;
+}
+
+export interface CacheList {
+  entries: CacheEntry[];
+}
+
+export interface CacheDetail {
+  key: string;
+  contentType: string;
+  body: string;
+}

@@ -65,3 +65,52 @@ func (s *Store) CleanExpiredCache() error {
 	_, err := s.db.Exec(`DELETE FROM cache WHERE expires_at <= ?`, time.Now().Unix())
 	return err
 }
+
+// CacheListEntry 是管理端缓存列表的单条视图：不带 body（列表轻量），
+// Key 为可读缓存键原文（REST 路径含 ?/&，MCP 键含冒号/花括号）。
+type CacheListEntry struct {
+	Key         string `json:"key"`
+	Size        int64  `json:"size"`
+	ContentType string `json:"contentType"`
+	ExpiresAt   int64  `json:"expiresAt"`
+}
+
+// ListCacheEntries 列出全部未过期缓存条目（不含 body），按 hash 升序。
+// 过滤口径与 GetCache 一致（expires_at > now）：管理界面不该看到
+// 下一次读取就会判 miss 的条目。
+func (s *Store) ListCacheEntries() ([]CacheListEntry, error) {
+	rows, err := s.db.Query(`SELECT hash, length(body), content_type, expires_at
+		FROM cache WHERE expires_at > ? ORDER BY hash`, time.Now().Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []CacheListEntry{} // 空 slice 编码为 []，非 nil（null 会让前端遍历炸）
+	for rows.Next() {
+		var e CacheListEntry
+		if err := rows.Scan(&e.Key, &e.Size, &e.ContentType, &e.ExpiresAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// GetCacheEntryDetail 取单条未过期缓存条目的原文 body（管理端查看用）。
+// 缺失或已过期返回 ErrCacheMiss——与 GetCache 同一口径，但只读不删除：
+// 惰性删除只属于查询路径，管理查看不做写动作。
+func (s *Store) GetCacheEntryDetail(hash string) (body []byte, contentType string, err error) {
+	var expiresAt int64
+	err = s.db.QueryRow(`SELECT body, content_type, expires_at FROM cache WHERE hash = ?`, hash).
+		Scan(&body, &contentType, &expiresAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, "", ErrCacheMiss
+		}
+		return nil, "", err
+	}
+	if expiresAt <= time.Now().Unix() {
+		return nil, "", ErrCacheMiss
+	}
+	return body, contentType, nil
+}
