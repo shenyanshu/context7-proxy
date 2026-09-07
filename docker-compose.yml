@@ -4,16 +4,15 @@
 
 services:
   proxy:
-    # 镜像来自 GHCR，例如 ghcr.io/<owner>/<repo>:v1.0.0（或 :latest）。
-    # 未设置 C7P_IMAGE 直接拒绝启动，防止误拉/误起。
-    image: ${C7P_IMAGE:?C7P_IMAGE is required, e.g. ghcr.io/<owner>/<repo>:latest}
+    # 真实镜像：发版 tag（v*）自动推送 GHCR（docker.yml）
+    image: ghcr.io/shenyanshu/context7-proxy:latest
     ports:
       - "8080:8080"
     environment:
-      # MASTER_KEY 是唯一必填凭证（REST/MCP/管理界面共用）：
-      # compose 层强制从环境注入，缺失直接拒绝启动而非带空 key 起服务
-      MASTER_KEY: ${MASTER_KEY:?MASTER_KEY is required}
-      # 与镜像内 ENV 一致：数据库落在卷里，容器重建数据不丢
+      # MASTER_KEY 是唯一凭证（REST/MCP/管理界面共用）。默认给一个占位值，
+      # 生产部署务必用环境变量覆盖：MASTER_KEY=你的密钥 docker compose up -d
+      MASTER_KEY: ${MASTER_KEY:-change-me-please}
+      # 数据库落在 compose 文件同目录的 ./data 下，容器重建数据不丢
       DB_PATH: /data/proxy.db
     restart: unless-stopped
     volumes:
