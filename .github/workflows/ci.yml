@@ -1,5 +1,6 @@
-# CI 常规门禁：主干 push 与所有 PR 上跑 Go 检查/测试和前端类型检查/构建。
-# 镜像构建不在此处（见 docker.yml）——测试与发布职责分离，互不拖慢。
+# CI 常规门禁：主干 push 与所有 PR。
+# 单 job 且前端构建在前：Go 的 go:embed all:dist 要求 web/dist 存在才能编译，
+# 顺序与 Dockerfile 一致——dist 永远现场构建，不进版本库。
 name: CI
 
 on:
@@ -11,10 +12,22 @@ permissions:
   contents: read
 
 jobs:
-  go:
+  build-and-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      # tsc -b && vite build：类型错误在 CI 拦截，同时产出 go:embed 所需的 dist
+      - run: npm run build
+        working-directory: web
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -23,19 +36,3 @@ jobs:
         run: test -z "$(gofmt -l cmd internal web)"
       - run: go vet ./...
       - run: go test -race ./...
-
-  web:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: web
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      - run: npm ci
-      # tsc -b && vite build：类型错误在 CI 拦截，不带病发版
-      - run: npm run build

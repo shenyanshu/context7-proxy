@@ -13,11 +13,21 @@ permissions:
   packages: write
 
 jobs:
-  # 发布前再测一次：tag 可能切自未经 CI 的提交，不测就推等于裸奔
+  # 发布前再测一次：tag 可能切自未经 CI 的提交，不测就推等于裸奔。
+  # 先构建前端：go:embed all:dist 要求 web/dist 存在才能编译（与 ci.yml 同因）
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - run: npm run build
+        working-directory: web
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -27,7 +37,7 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # GHCR 要求镜像名全小写，仓库路径可能含大写字母（如 Context7-Proxy）。
       # 用 tr 而非 bash4 的 ${var,,}：行为相同且任何 shell 可验证
       - name: 计算小写镜像名
